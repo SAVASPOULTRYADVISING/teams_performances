@@ -67,25 +67,89 @@ async function getAllPages(path, token) {
   return results;
 }
 
-async function getContribStats(org, repoName, token, cutoffTs) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    if (cancelled) return [];
-    const r = await fetch('https://api.github.com/repos/' + org + '/' + repoName + '/stats/contributors', {
-      headers: { 'Authorization': 'token ' + token }
-    });
-    if (r.status === 202) {
-      await sleep(2500);
-      continue;
-    }
-    if (r.status !== 200) return [];
-    const data = await r.json();
-    if (!Array.isArray(data)) return [];
-    return data;
+async function ghGraphQL(query, variables, token) {
+  if (cancelled) throw new Error('Cancelled');
+  const r = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'bearer ' + token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok || body.errors) {
+    const msg = (body.errors && body.errors[0] && body.errors[0].message) || ('HTTP ' + r.status);
+    throw new Error('GraphQL ' + r.status + ': ' + msg);
   }
-  return [];
+  return body.data;
+}
+
+async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
+  const query = `
+    query($owner: String!, $name: String!, $since: GitTimestamp!, $after: String) {
+      repository(owner: $owner, name: $name) {
+        defaultBranchRef {
+          target {
+            ... on Commit {
+              history(first: 100, since: $since, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  oid
+                  additions
+                  deletions
+                  committedDate
+                  author { user { login avatarUrl } email name }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+  const out = [];
+  let after = null;
+  while (true) {
+    if (cancelled) throw new Error('Cancelled');
+    const data = await ghGraphQL(query, { owner: org, name: repoName, since: sinceISO, after }, token);
+    const branch = data && data.repository && data.repository.defaultBranchRef;
+    if (!branch || !branch.target || !branch.target.history) return out;
+    const hist = branch.target.history;
+    for (const n of (hist.nodes || [])) {
+      const a = n.author || {};
+      const user = a.user;
+      out.push({
+        githubLogin: (user && user.login) || '',
+        avatar: (user && user.avatarUrl) || '',
+        email: a.email || '',
+        name: a.name || '',
+        additions: n.additions || 0,
+        deletions: n.deletions || 0,
+        committedDate: n.committedDate || ''
+      });
+    }
+    if (!hist.pageInfo || !hist.pageInfo.hasNextPage) break;
+    after = hist.pageInfo.endCursor;
+  }
+  return out;
 }
 
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+
+function emailLocalPart(s) {
+  const v = (s || '').trim();
+  if (!v) return '';
+  const at = v.indexOf('@');
+  return at === -1 ? v : v.slice(0, at);
+}
+
+function normalizeIdentityKey(s) {
+  const v = (s || '').trim().toLowerCase();
+  if (!v) return '';
+  // Treat separators as equivalent: brahim-elkaceh == brahimelkaceh
+  return v.replace(/[^a-z0-9]/g, '');
+}
 
 // ── Main loader ──────────────────────────────────────────────────────────────
 async function loadMetrics(token, org, days) {
@@ -102,7 +166,6 @@ async function loadMetrics(token, org, days) {
   setProgress('Connecting to GitHub…', 5);
 
   const SINCE = new Date(Date.now() - days * 864e5).toISOString();
-  const cutoffTs = Math.floor(Date.now() / 1000) - days * 86400;
 
   try {
     // Verify token
@@ -124,11 +187,17 @@ async function loadMetrics(token, org, days) {
 
     if (!repos.length) throw new Error('No repositories found in ' + org);
 
+    // Exclude repos with _build suffix
+    repos = repos.filter(r => !r.name.endsWith('_build'));
+
+    if (!repos.length) throw new Error('No repositories found in ' + org + ' after filtering');
+
     // Sort by most recently updated
     repos.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
 
     const CM = {};   // contributor map
     const WM = {};   // weekly/monthly commit map
+    const aliasToLogin = {}; // normalized email/name → github login
     let totA = 0, totD = 0, totC = 0;
 
     const total = repos.length;
@@ -138,57 +207,69 @@ async function loadMetrics(token, org, days) {
       const repo = repos[i];
       const pct = 15 + ((i / total) * 70);
 
-      // Commits
-      setProgress('Commits (' + (i + 1) + '/' + total + '): ' + repo.name, pct);
+      setProgress('Repo (' + (i + 1) + '/' + total + '): ' + repo.name, pct);
       try {
-        const commits = await getAllPages(
-          '/repos/' + org + '/' + repo.name + '/commits?since=' + SINCE,
-          token
-        );
-        totC += commits.length;
+        const commits = await fetchRepoCommitsWithStats(org, repo.name, SINCE, token);
         for (const c of commits) {
-          const login = (c.author && c.author.login) ||
-                        (c.commit && c.commit.author && c.commit.author.name) ||
-                        'unknown';
-          const avatar = (c.author && c.author.avatar_url) || '';
-          const dateStr = (c.commit && c.commit.author && c.commit.author.date) || '';
+          const ghLogin = (c.githubLogin || '').trim();
+          const emailLocal = emailLocalPart(c.email).trim();
+          const nameRaw = (c.name || '').trim();
+          const emailKey = normalizeIdentityKey(emailLocal);
+          const nameKey = normalizeIdentityKey(nameRaw);
+          const ghKey = normalizeIdentityKey(ghLogin);
 
-          if (!CM[login]) CM[login] = { login, avatar, commits: 0, additions: 0, deletions: 0, repos: [] };
+          if (ghLogin) {
+            if (emailKey) aliasToLogin[emailKey] = ghLogin;
+            if (nameKey) aliasToLogin[nameKey] = ghLogin;
+            if (ghKey) aliasToLogin[ghKey] = ghLogin;
+
+            // Small heuristic: treat "*savas" accounts as same person as base handle.
+            // Example: "ahmederrajaai" == "ahmederrajaaisavas"
+            const ghLower = ghLogin.toLowerCase();
+            if (ghLower.endsWith('savas') && ghLower.length > 'savas'.length) {
+              const base = ghLogin.slice(0, -'savas'.length);
+              const baseKey = normalizeIdentityKey(base);
+              if (baseKey) aliasToLogin[baseKey] = ghLogin;
+            }
+          }
+
+          const login =
+            ghLogin ||
+            (emailKey && aliasToLogin[emailKey]) ||
+            (nameKey && aliasToLogin[nameKey]) ||
+            emailLocal ||
+            nameRaw ||
+            'unknown';
+
+          if (!CM[login]) CM[login] = { login, avatar: c.avatar, commits: 0, additions: 0, deletions: 0, repos: [] };
           CM[login].commits++;
-          if (avatar && !CM[login].avatar) CM[login].avatar = avatar;
+          CM[login].additions += c.additions;
+          CM[login].deletions += c.deletions;
+          if (c.avatar && !CM[login].avatar) CM[login].avatar = c.avatar;
           if (!CM[login].repos.includes(repo.name)) CM[login].repos.push(repo.name);
 
-          if (dateStr) {
-            const k = dateStr.slice(0, 7); // YYYY-MM
+          totC++;
+          totA += c.additions;
+          totD += c.deletions;
+
+          if (c.committedDate) {
+            const k = c.committedDate.slice(0, 7); // YYYY-MM
             WM[k] = (WM[k] || 0) + 1;
           }
         }
-      } catch (e) { /* skip repo if forbidden */ }
-
-      // Contributor stats (additions/deletions)
-      setProgress('Stats (' + (i + 1) + '/' + total + '): ' + repo.name, pct + 0.5);
-      try {
-        const stats = await getContribStats(org, repo.name, token, cutoffTs);
-        for (const s of stats) {
-          const login = s.author && s.author.login;
-          if (!login) continue;
-          if (!CM[login]) CM[login] = { login, avatar: s.author.avatar_url || '', commits: 0, additions: 0, deletions: 0, repos: [] };
-          for (const w of (s.weeks || [])) {
-            if (w.w >= cutoffTs) {
-              CM[login].additions += (w.a || 0);
-              CM[login].deletions += (w.d || 0);
-              totA += (w.a || 0);
-              totD += (w.d || 0);
-            }
-          }
-        }
-      } catch (e) { /* skip */ }
+      } catch (e) { /* skip repo on error (empty repo, no access, etc.) */ }
     }
 
     setProgress('Rendering…', 90);
 
     const contributors = Object.values(CM)
-      .sort((a, b) => (b.additions + b.deletions + b.commits * 10) - (a.additions + a.deletions + a.commits * 10));
+      .sort((a, b) => {
+        const netB = (b.additions - b.deletions);
+        const netA = (a.additions - a.deletions);
+        if (netB !== netA) return netB - netA;          // NET desc
+        if (b.commits !== a.commits) return b.commits - a.commits; // commits desc
+        return a.login.localeCompare(b.login);          // stable-ish tie-breaker
+      });
 
     const weekly = Object.entries(WM)
       .sort((a, b) => a[0] < b[0] ? -1 : 1)
@@ -225,12 +306,12 @@ function renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, 
 
   // Metric cards
   const metricsData = [
-    { label: 'Total Commits',   value: totC.toLocaleString(),                         icon: '📝' },
-    { label: 'Lines Added',     value: '+' + totA.toLocaleString(),                   icon: '🟢', cls: 'green' },
-    { label: 'Lines Removed',   value: '−' + totD.toLocaleString(),                   icon: '🔴', cls: 'red' },
-    { label: 'Net Change',      value: (net >= 0 ? '+' : '') + net.toLocaleString(),  icon: '📊', cls: net >= 0 ? 'green' : 'red' },
-    { label: 'Repositories',   value: repos.length,                                   icon: '📁' },
-    { label: 'Contributors',   value: contributors.length,                             icon: '👥' },
+    { label: 'Total Commits', value: totC.toLocaleString(), icon: '📝' },
+    { label: 'Lines Added', value: '+' + totA.toLocaleString(), icon: '🟢', cls: 'green' },
+    { label: 'Lines Removed', value: '−' + totD.toLocaleString(), icon: '🔴', cls: 'red' },
+    { label: 'Net Change', value: (net >= 0 ? '+' : '') + net.toLocaleString(), icon: '📊', cls: net >= 0 ? 'green' : 'red' },
+    { label: 'Repositories', value: repos.length, icon: '📁' },
+    { label: 'Contributors', value: contributors.length, icon: '👥' },
   ];
 
   $('metricGrid').innerHTML = metricsData.map(m => `
@@ -358,10 +439,7 @@ function renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, 
           </div>
         </td>
         <td class="num">${c.commits.toLocaleString()}</td>
-        <td class="num green">+${c.additions.toLocaleString()}</td>
-        <td class="num red">−${c.deletions.toLocaleString()}</td>
         <td class="num ${net >= 0 ? 'green' : 'red'}">${net >= 0 ? '+' : ''}${net.toLocaleString()}</td>
-        <td class="muted">${c.repos.join(', ')}</td>
       </tr>
     `;
   }).join('');
@@ -408,12 +486,20 @@ function timeAgo(dateStr) {
 $('configForm').addEventListener('submit', e => {
   e.preventDefault();
   const token = $('token').value.trim();
-  const org   = $('org').value.trim();
-  const days  = parseInt($('days').value);
+  const org = $('org').value.trim();
+  const days = parseInt($('days').value);
 
   if (!token) { showError('Please enter a GitHub personal access token.'); return; }
-  if (!org)   { showError('Please enter an organization or user name.'); return; }
+  if (!org) { showError('Please enter an organization or user name.'); return; }
+
+  try { localStorage.setItem('gh_metrics_token', token); } catch (_) { }
 
   clearError();
   loadMetrics(token, org, days);
 });
+
+// Restore token from localStorage (best-effort)
+try {
+  const saved = localStorage.getItem('gh_metrics_token');
+  if (saved && !$('token').value) $('token').value = saved;
+} catch (_) { }
