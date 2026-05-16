@@ -85,11 +85,53 @@ async function ghGraphQL(query, variables, token) {
   return body.data;
 }
 
-async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
+async function fetchAllBranchRefNames(owner, name, token) {
   const query = `
-    query($owner: String!, $name: String!, $since: GitTimestamp!, $after: String) {
+    query($owner: String!, $name: String!, $cursor: String) {
       repository(owner: $owner, name: $name) {
-        defaultBranchRef {
+        refs(first: 100, refPrefix: "refs/heads/", after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { name }
+        }
+      }
+    }
+  `;
+  const names = [];
+  let cursor = null;
+  while (true) {
+    if (cancelled) throw new Error('Cancelled');
+    const data = await ghGraphQL(query, { owner, name, cursor }, token);
+    const refs = data && data.repository && data.repository.refs;
+    if (!refs || !refs.nodes || !refs.nodes.length) break;
+    for (const n of refs.nodes) {
+      if (n && n.name) names.push('refs/heads/' + n.name);
+    }
+    if (!refs.pageInfo || !refs.pageInfo.hasNextPage) break;
+    cursor = refs.pageInfo.endCursor;
+  }
+  return names;
+}
+
+async function fetchDefaultBranchQualifiedName(owner, name, token) {
+  const query = `
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        defaultBranchRef { qualifiedName }
+      }
+    }
+  `;
+  if (cancelled) throw new Error('Cancelled');
+  const data = await ghGraphQL(query, { owner, name }, token);
+  const q = data && data.repository && data.repository.defaultBranchRef && data.repository.defaultBranchRef.qualifiedName;
+  return q ? [q] : [];
+}
+
+/** Commits across all local branches; same commit on multiple branches is counted once (by oid). */
+async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
+  const historyQuery = `
+    query($owner: String!, $name: String!, $since: GitTimestamp!, $qualifiedRef: String!, $after: String) {
+      repository(owner: $owner, name: $name) {
+        ref(qualifiedName: $qualifiedRef) {
           target {
             ... on Commit {
               history(first: 100, since: $since, after: $after) {
@@ -108,31 +150,47 @@ async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
       }
     }
   `;
-  const out = [];
-  let after = null;
-  while (true) {
-    if (cancelled) throw new Error('Cancelled');
-    const data = await ghGraphQL(query, { owner: org, name: repoName, since: sinceISO, after }, token);
-    const branch = data && data.repository && data.repository.defaultBranchRef;
-    if (!branch || !branch.target || !branch.target.history) return out;
-    const hist = branch.target.history;
-    for (const n of (hist.nodes || [])) {
-      const a = n.author || {};
-      const user = a.user;
-      out.push({
-        githubLogin: (user && user.login) || '',
-        avatar: (user && user.avatarUrl) || '',
-        email: a.email || '',
-        name: a.name || '',
-        additions: n.additions || 0,
-        deletions: n.deletions || 0,
-        committedDate: n.committedDate || ''
-      });
+  let refNames = await fetchAllBranchRefNames(org, repoName, token);
+  if (!refNames.length) refNames = await fetchDefaultBranchQualifiedName(org, repoName, token);
+  if (!refNames.length) return [];
+
+  const byOid = new Map();
+
+  for (const qualifiedRef of refNames) {
+    let after = null;
+    while (true) {
+      if (cancelled) throw new Error('Cancelled');
+      const data = await ghGraphQL(historyQuery, {
+        owner: org,
+        name: repoName,
+        since: sinceISO,
+        qualifiedRef,
+        after
+      }, token);
+      const refObj = data && data.repository && data.repository.ref;
+      const target = refObj && refObj.target;
+      const hist = target && target.history;
+      if (!hist || !hist.nodes) break;
+      for (const n of hist.nodes) {
+        if (!n || !n.oid || byOid.has(n.oid)) continue;
+        const a = n.author || {};
+        const user = a.user;
+        byOid.set(n.oid, {
+          githubLogin: (user && user.login) || '',
+          avatar: (user && user.avatarUrl) || '',
+          email: a.email || '',
+          name: a.name || '',
+          additions: n.additions || 0,
+          deletions: n.deletions || 0,
+          committedDate: n.committedDate || ''
+        });
+      }
+      if (!hist.pageInfo || !hist.pageInfo.hasNextPage) break;
+      after = hist.pageInfo.endCursor;
     }
-    if (!hist.pageInfo || !hist.pageInfo.hasNextPage) break;
-    after = hist.pageInfo.endCursor;
   }
-  return out;
+
+  return Array.from(byOid.values());
 }
 
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
@@ -149,6 +207,20 @@ function normalizeIdentityKey(s) {
   if (!v) return '';
   // Treat separators as equivalent: brahim-elkaceh == brahimelkaceh
   return v.replace(/[^a-z0-9]/g, '');
+}
+
+/** Merge org-style GitHub logins that end with "savas" into the base handle (e.g. ahmederrajaaisavas → ahmederrajaai). */
+function canonicalContributorLogin(login) {
+  const s = String(login || '').trim();
+  if (!s || s === 'unknown') return s;
+  const lower = s.toLowerCase();
+  const suf = 'savas';
+  if (lower.endsWith(suf) && lower.length > suf.length) {
+    let base = s.slice(0, -suf.length);
+    if (base.endsWith('-')) base = base.slice(0, -1);
+    return base || s;
+  }
+  return s;
 }
 
 // ── Main loader ──────────────────────────────────────────────────────────────
@@ -219,27 +291,27 @@ async function loadMetrics(token, org, days) {
           const ghKey = normalizeIdentityKey(ghLogin);
 
           if (ghLogin) {
-            if (emailKey) aliasToLogin[emailKey] = ghLogin;
-            if (nameKey) aliasToLogin[nameKey] = ghLogin;
-            if (ghKey) aliasToLogin[ghKey] = ghLogin;
+            const canonGh = canonicalContributorLogin(ghLogin);
+            if (emailKey) aliasToLogin[emailKey] = canonGh;
+            if (nameKey) aliasToLogin[nameKey] = canonGh;
+            if (ghKey) aliasToLogin[ghKey] = canonGh;
 
-            // Small heuristic: treat "*savas" accounts as same person as base handle.
-            // Example: "ahmederrajaai" == "ahmederrajaaisavas"
+            // Map normalized base handle → canonical login so email/name aliases line up.
             const ghLower = ghLogin.toLowerCase();
             if (ghLower.endsWith('savas') && ghLower.length > 'savas'.length) {
-              const base = ghLogin.slice(0, -'savas'.length);
-              const baseKey = normalizeIdentityKey(base);
-              if (baseKey) aliasToLogin[baseKey] = ghLogin;
+              const baseKey = normalizeIdentityKey(canonGh);
+              if (baseKey) aliasToLogin[baseKey] = canonGh;
             }
           }
 
-          const login =
+          const login = canonicalContributorLogin(
             ghLogin ||
             (emailKey && aliasToLogin[emailKey]) ||
             (nameKey && aliasToLogin[nameKey]) ||
             emailLocal ||
             nameRaw ||
-            'unknown';
+            'unknown'
+          );
 
           if (!CM[login]) CM[login] = { login, avatar: c.avatar, commits: 0, additions: 0, deletions: 0, repos: [] };
           CM[login].commits++;
@@ -302,7 +374,7 @@ function renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, 
   // Header
   $('dashTitle').textContent = org;
   $('dashSubtitle').textContent =
-    'Last ' + days + ' days  ·  ' + repos.length + ' repos  ·  ' + contributors.length + ' contributors';
+    'Last ' + days + ' days  ·  ' + repos.length + ' repos  ·  ' + contributors.length + ' contributors  ·  all branches (commits deduped)';
 
   // Metric cards
   const metricsData = [
