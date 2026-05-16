@@ -1,8 +1,11 @@
 'use strict';
 
 let charts = [];
+let weeklyNetChart = null;
 let cancelled = false;
 let lastParams = null;
+let lastDashboardData = null;
+let activePage = 'overview';
 
 // ── DOM helpers ──────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -223,6 +226,52 @@ function canonicalContributorLogin(login) {
   return s;
 }
 
+function weekStartKey(isoDate) {
+  const d = new Date(isoDate);
+  const day = d.getUTCDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+function formatWeekLabel(weekKey) {
+  const d = new Date(weekKey + 'T00:00:00Z');
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+function enumerateWeeks(sinceISO) {
+  const since = new Date(sinceISO);
+  const end = new Date();
+  let start = weekStartKey(since.toISOString());
+  if (start < sinceISO.slice(0, 10)) {
+    const d = new Date(start + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 7);
+    start = d.toISOString().slice(0, 10);
+  }
+  const weeks = [];
+  const cur = new Date(start + 'T00:00:00Z');
+  const endMs = end.getTime();
+  while (cur.getTime() <= endMs) {
+    weeks.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 7);
+  }
+  return weeks;
+}
+
+function buildWeeklyNetSeries(CWN, contributors, sinceISO) {
+  const weeks = enumerateWeeks(sinceISO);
+  const top = contributors.slice(0, 10);
+  const series = top.map(c => ({
+    login: c.login,
+    data: weeks.map(w => (CWN[c.login] && CWN[c.login][w]) || 0)
+  }));
+  return { weeks, series };
+}
+
+function formatNet(n) {
+  return (n >= 0 ? '+' : '') + n.toLocaleString();
+}
+
 // ── Main loader ──────────────────────────────────────────────────────────────
 async function loadMetrics(token, org, days) {
   cancelled = false;
@@ -231,7 +280,9 @@ async function loadMetrics(token, org, days) {
 
   // UI state: loading
   hide('dashboard');
+  hide('weeklyNetView');
   hide('emptyState');
+  hide('sidebarNav');
   show('progress');
   hide('sidebarStats');
   $('loadBtn').disabled = true;
@@ -269,6 +320,7 @@ async function loadMetrics(token, org, days) {
 
     const CM = {};   // contributor map
     const WM = {};   // weekly/monthly commit map
+    const CWN = {};  // contributor weekly NET map
     const aliasToLogin = {}; // normalized email/name → github login
     let totA = 0, totD = 0, totC = 0;
 
@@ -327,6 +379,9 @@ async function loadMetrics(token, org, days) {
           if (c.committedDate) {
             const k = c.committedDate.slice(0, 7); // YYYY-MM
             WM[k] = (WM[k] || 0) + 1;
+            const wk = weekStartKey(c.committedDate);
+            if (!CWN[login]) CWN[login] = {};
+            CWN[login][wk] = (CWN[login][wk] || 0) + (c.additions - c.deletions);
           }
         }
       } catch (e) { /* skip repo on error (empty repo, no access, etc.) */ }
@@ -347,7 +402,9 @@ async function loadMetrics(token, org, days) {
       .sort((a, b) => a[0] < b[0] ? -1 : 1)
       .map(([w, c]) => ({ w, c }));
 
-    renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, org });
+    const weeklyNet = buildWeeklyNetSeries(CWN, contributors, SINCE);
+
+    renderDashboard({ repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO: SINCE });
 
   } catch (e) {
     hide('progress');
@@ -359,22 +416,114 @@ async function loadMetrics(token, org, days) {
   }
 }
 
+// ── Page navigation ────────────────────────────────────────────────────────────
+const CHART_COLORS = ['#58a6ff', '#3fb950', '#f85149', '#bc8cff', '#d29922', '#79c0ff', '#ffa657', '#ff7b72', '#a5d6ff', '#7ee787'];
+
+function destroyWeeklyNetChart() {
+  if (weeklyNetChart) {
+    weeklyNetChart.destroy();
+    weeklyNetChart = null;
+  }
+}
+
+function setActivePage(page) {
+  if (!lastDashboardData) return;
+  activePage = page;
+
+  document.querySelectorAll('.nav-link').forEach(el => {
+    el.classList.toggle('active', el.dataset.page === page);
+  });
+
+  if (page === 'overview') {
+    destroyWeeklyNetChart();
+    show('dashboard');
+    hide('weeklyNetView');
+  } else {
+    hide('dashboard');
+    show('weeklyNetView');
+    renderWeeklyNetChart(lastDashboardData.weeklyNet);
+  }
+}
+
+function renderWeeklyNetChart({ weeks, series }) {
+  destroyWeeklyNetChart();
+  if (!weeks.length || !series.length) return;
+
+  const ctx = $('weeklyNetChart').getContext('2d');
+  weeklyNetChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: weeks.map(formatWeekLabel),
+      datasets: series.map((s, i) => ({
+        label: s.login,
+        data: s.data,
+        borderColor: CHART_COLORS[i % CHART_COLORS.length],
+        backgroundColor: 'transparent',
+        tension: 0.3,
+        pointRadius: 3,
+        pointHoverRadius: 5,
+        borderWidth: 2
+      }))
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          labels: { color: '#8b949e', font: { size: 12 }, boxWidth: 12, boxHeight: 12 }
+        },
+        tooltip: {
+          mode: 'index',
+          intersect: false,
+          callbacks: {
+            label: ctx => ctx.dataset.label + ': ' + formatNet(ctx.parsed.y)
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#6e7681', font: { size: 11 }, maxRotation: 45 },
+          grid: { color: '#21262d' }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            color: '#6e7681',
+            font: { size: 11 },
+            callback: v => formatNet(v)
+          },
+          grid: { color: '#21262d' }
+        }
+      }
+    }
+  });
+}
+
 // ── Render ───────────────────────────────────────────────────────────────────
-function renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, org }) {
+function renderDashboard({ repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO }) {
   hide('progress');
   hide('emptyState');
   $('loadBtn').disabled = false;
 
+  lastDashboardData = { repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO };
+
   // Destroy old charts
   charts.forEach(c => c.destroy());
   charts = [];
+  destroyWeeklyNetChart();
 
   const net = totA - totD;
+  const subtitle =
+    'Last ' + days + ' days  ·  ' + repos.length + ' repos  ·  ' + contributors.length + ' contributors  ·  all branches (commits deduped)';
 
   // Header
   $('dashTitle').textContent = org;
-  $('dashSubtitle').textContent =
-    'Last ' + days + ' days  ·  ' + repos.length + ' repos  ·  ' + contributors.length + ' contributors  ·  all branches (commits deduped)';
+  $('dashSubtitle').textContent = subtitle;
+  $('weeklyNetTitle').textContent = org;
+  $('weeklyNetSubtitle').textContent = subtitle;
 
   // Metric cards
   const metricsData = [
@@ -534,7 +683,8 @@ function renderDashboard({ repos, contributors, weekly, totA, totD, totC, days, 
     </div>
   `).join('');
 
-  show('dashboard');
+  show('sidebarNav');
+  setActivePage('overview');
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
@@ -575,3 +725,12 @@ try {
   const saved = localStorage.getItem('gh_metrics_token');
   if (saved && !$('token').value) $('token').value = saved;
 } catch (_) { }
+
+// Sidebar navigation
+document.querySelectorAll('.nav-link').forEach(el => {
+  el.addEventListener('click', e => {
+    e.preventDefault();
+    if (!lastDashboardData) return;
+    setActivePage(el.dataset.page);
+  });
+});
