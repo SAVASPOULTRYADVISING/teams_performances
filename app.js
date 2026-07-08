@@ -1,41 +1,53 @@
 'use strict';
 
-let charts = [];
-let weeklyNetChart = null;
-let cancelled = false;
-let lastParams = null;
-let lastDashboardData = null;
-let activePage = 'overview';
+/*
+ * GitHub Team Metrics — data & rendering
+ *
+ * Attribution model (see README):
+ *   • Work is attributed to the commit AUTHOR (who wrote the code), never the
+ *     committer (who recorded it — often a rebase/merge/bot). GitHub GraphQL
+ *     exposes both; `author.user.login` is the linked account.
+ *   • Commits are read across ALL branches and de-duplicated by SHA (oid), so a
+ *     commit that lives on a feature branch and on main is counted once.
+ *   • Merge commits (parents > 1) are excluded — their additions/deletions
+ *     duplicate the branch they merge, which would inflate line counts.
+ *   • Bot accounts are excluded.
+ *   • Net contribution = additions − deletions.
+ */
+
+// ── App state ────────────────────────────────────────────────────────────────
+// `var` (not `let`) so these singletons are reachable on the global object for
+// debugging in the browser console; behaviour is otherwise identical.
+var RAW = null;            // { records, memberMeta, repos, sinceISO, days, org }
+var DATA = null;           // aggregated view for the current granularity
+var granularity = 'week';  // 'week' | 'month'
+var activeView = 'overview';
+var charts = [];
+var cancelled = false;
+var lastParams = null;
 
 // ── DOM helpers ──────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
-const show = id => $(id).style.display = '';
-const hide = id => $(id).style.display = 'none';
+const show = id => { const el = $(id); if (el) el.style.display = ''; };
+const hide = id => { const el = $(id); if (el) el.style.display = 'none'; };
 
 function setProgress(label, pct) {
   $('progressLabel').textContent = label;
   $('progressBar').style.width = Math.min(100, pct) + '%';
 }
-
 function showError(msg) {
   $('errorBanner').style.display = 'block';
-  $('errorBanner').innerHTML = '⚠️ ' + msg;
+  $('errorBanner').innerHTML = '⚠️ ' + escHtml(msg);
 }
-
 function clearError() {
   hide('errorBanner');
   $('errorBanner').innerHTML = '';
 }
-
 function toggleToken() {
   const inp = $('token');
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
-
-function cancelLoad() {
-  cancelled = true;
-}
-
+function cancelLoad() { cancelled = true; }
 function reload() {
   if (lastParams) loadMetrics(lastParams.token, lastParams.org, lastParams.days);
 }
@@ -44,10 +56,7 @@ function reload() {
 async function ghFetch(path, token) {
   if (cancelled) throw new Error('Cancelled');
   const r = await fetch('https://api.github.com' + path, {
-    headers: {
-      'Authorization': 'token ' + token,
-      'Accept': 'application/vnd.github.v3+json'
-    }
+    headers: { 'Authorization': 'token ' + token, 'Accept': 'application/vnd.github.v3+json' }
   });
   if (!r.ok) {
     const body = await r.json().catch(() => ({}));
@@ -74,10 +83,7 @@ async function ghGraphQL(query, variables, token) {
   if (cancelled) throw new Error('Cancelled');
   const r = await fetch('https://api.github.com/graphql', {
     method: 'POST',
-    headers: {
-      'Authorization': 'bearer ' + token,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': 'bearer ' + token, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables })
   });
   const body = await r.json().catch(() => ({}));
@@ -97,8 +103,7 @@ async function fetchAllBranchRefNames(owner, name, token) {
           nodes { name }
         }
       }
-    }
-  `;
+    }`;
   const names = [];
   let cursor = null;
   while (true) {
@@ -106,9 +111,7 @@ async function fetchAllBranchRefNames(owner, name, token) {
     const data = await ghGraphQL(query, { owner, name, cursor }, token);
     const refs = data && data.repository && data.repository.refs;
     if (!refs || !refs.nodes || !refs.nodes.length) break;
-    for (const n of refs.nodes) {
-      if (n && n.name) names.push('refs/heads/' + n.name);
-    }
+    for (const n of refs.nodes) if (n && n.name) names.push('refs/heads/' + n.name);
     if (!refs.pageInfo || !refs.pageInfo.hasNextPage) break;
     cursor = refs.pageInfo.endCursor;
   }
@@ -118,18 +121,15 @@ async function fetchAllBranchRefNames(owner, name, token) {
 async function fetchDefaultBranchQualifiedName(owner, name, token) {
   const query = `
     query($owner: String!, $name: String!) {
-      repository(owner: $owner, name: $name) {
-        defaultBranchRef { qualifiedName }
-      }
-    }
-  `;
+      repository(owner: $owner, name: $name) { defaultBranchRef { qualifiedName } }
+    }`;
   if (cancelled) throw new Error('Cancelled');
   const data = await ghGraphQL(query, { owner, name }, token);
   const q = data && data.repository && data.repository.defaultBranchRef && data.repository.defaultBranchRef.qualifiedName;
   return q ? [q] : [];
 }
 
-/** Commits across all local branches; same commit on multiple branches is counted once (by oid). */
+/** Commits across all branches, de-duplicated by oid. Includes merge flag. */
 async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
   const historyQuery = `
     query($owner: String!, $name: String!, $since: GitTimestamp!, $qualifiedRef: String!, $after: String) {
@@ -144,6 +144,7 @@ async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
                   additions
                   deletions
                   committedDate
+                  parents { totalCount }
                   author { user { login avatarUrl } email name }
                 }
               }
@@ -151,28 +152,20 @@ async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
           }
         }
       }
-    }
-  `;
+    }`;
+
   let refNames = await fetchAllBranchRefNames(org, repoName, token);
   if (!refNames.length) refNames = await fetchDefaultBranchQualifiedName(org, repoName, token);
   if (!refNames.length) return [];
 
   const byOid = new Map();
-
   for (const qualifiedRef of refNames) {
     let after = null;
     while (true) {
       if (cancelled) throw new Error('Cancelled');
-      const data = await ghGraphQL(historyQuery, {
-        owner: org,
-        name: repoName,
-        since: sinceISO,
-        qualifiedRef,
-        after
-      }, token);
+      const data = await ghGraphQL(historyQuery, { owner: org, name: repoName, since: sinceISO, qualifiedRef, after }, token);
       const refObj = data && data.repository && data.repository.ref;
-      const target = refObj && refObj.target;
-      const hist = target && target.history;
+      const hist = refObj && refObj.target && refObj.target.history;
       if (!hist || !hist.nodes) break;
       for (const n of hist.nodes) {
         if (!n || !n.oid || byOid.has(n.oid)) continue;
@@ -185,19 +178,19 @@ async function fetchRepoCommitsWithStats(org, repoName, sinceISO, token) {
           name: a.name || '',
           additions: n.additions || 0,
           deletions: n.deletions || 0,
-          committedDate: n.committedDate || ''
+          committedDate: n.committedDate || '',
+          isMerge: !!(n.parents && n.parents.totalCount > 1),
+          repo: repoName
         });
       }
       if (!hist.pageInfo || !hist.pageInfo.hasNextPage) break;
       after = hist.pageInfo.endCursor;
     }
   }
-
   return Array.from(byOid.values());
 }
 
-function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
-
+// ── Identity resolution (person, not raw committer) ──────────────────────────
 function emailLocalPart(s) {
   const v = (s || '').trim();
   if (!v) return '';
@@ -212,7 +205,7 @@ function normalizeIdentityKey(s) {
   return v.replace(/[^a-z0-9]/g, '');
 }
 
-/** Merge org-style GitHub logins that end with "savas" into the base handle (e.g. ahmederrajaaisavas → ahmederrajaai). */
+/** Merge org-style logins ending in "savas" into the base handle (ahmederrajaaisavas → ahmederrajaai). */
 function canonicalContributorLogin(login) {
   const s = String(login || '').trim();
   if (!s || s === 'unknown') return s;
@@ -226,447 +219,467 @@ function canonicalContributorLogin(login) {
   return s;
 }
 
-function weekStartKey(isoDate) {
+const BOT_LOGINS = new Set(['dependabot', 'dependabot-preview', 'github-actions', 'renovate', 'renovate-bot', 'snyk-bot', 'codecov-commenter', 'imgbot', 'web-flow']);
+function isBotIdentity(login, name) {
+  const l = (login || '').toLowerCase();
+  const n = (name || '').toLowerCase();
+  if (/\[bot\]$/.test(l) || /\[bot\]$/.test(n)) return true;
+  if (BOT_LOGINS.has(l)) return true;
+  return false;
+}
+
+/**
+ * Two-pass author→member resolution.
+ * Pass 1 learns every email/name/login alias for accounts that carry a GitHub
+ * login, so pass 2 attributes commits consistently regardless of the order they
+ * were fetched in (the previous single-pass version mis-attributed early
+ * commits whose alias had not been seen yet).
+ */
+function resolveMembers(commits) {
+  const aliasToLogin = {};
+  for (const c of commits) {
+    const ghLogin = (c.githubLogin || '').trim();
+    if (!ghLogin) continue;
+    const canon = canonicalContributorLogin(ghLogin);
+    const emailKey = normalizeIdentityKey(emailLocalPart(c.email));
+    const nameKey = normalizeIdentityKey(c.name);
+    const ghKey = normalizeIdentityKey(ghLogin);
+    if (emailKey) aliasToLogin[emailKey] = canon;
+    if (nameKey) aliasToLogin[nameKey] = canon;
+    if (ghKey) aliasToLogin[ghKey] = canon;
+    const baseKey = normalizeIdentityKey(canon);
+    if (baseKey) aliasToLogin[baseKey] = canon; // link base handle to canonical
+  }
+
+  const records = [];
+  const memberMeta = {};
+  for (const c of commits) {
+    if (c.isMerge) continue; // exclude merge commits from line stats
+    const ghLogin = (c.githubLogin || '').trim();
+    const emailLocal = emailLocalPart(c.email).trim();
+    const nameRaw = (c.name || '').trim();
+    if (isBotIdentity(ghLogin, nameRaw)) continue;
+
+    const emailKey = normalizeIdentityKey(emailLocal);
+    const nameKey = normalizeIdentityKey(nameRaw);
+    const member = canonicalContributorLogin(
+      ghLogin ||
+      (emailKey && aliasToLogin[emailKey]) ||
+      (nameKey && aliasToLogin[nameKey]) ||
+      emailLocal || nameRaw || 'unknown'
+    );
+
+    if (!memberMeta[member]) memberMeta[member] = { avatar: c.avatar || '' };
+    else if (c.avatar && !memberMeta[member].avatar) memberMeta[member].avatar = c.avatar;
+
+    records.push({ member, a: c.additions, d: c.deletions, date: c.committedDate, repo: c.repo });
+  }
+  return { records, memberMeta };
+}
+
+// ── Period helpers ───────────────────────────────────────────────────────────
+function startOfWeekISO(isoDate) {
   const d = new Date(isoDate);
-  const day = d.getUTCDay();
-  const diff = day === 0 ? -6 : 1 - day;
+  const day = d.getUTCDay();               // 0=Sun..6=Sat
+  const diff = day === 0 ? -6 : 1 - day;   // back to Monday
   d.setUTCDate(d.getUTCDate() + diff);
+  d.setUTCHours(0, 0, 0, 0);
   return d.toISOString().slice(0, 10);
 }
-
-function formatWeekLabel(weekKey) {
-  const d = new Date(weekKey + 'T00:00:00Z');
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
-}
+function monthKey(isoDate) { return String(isoDate).slice(0, 7); }
+function periodKeyOf(isoDate, gran) { return gran === 'month' ? monthKey(isoDate) : startOfWeekISO(isoDate); }
 
 function enumerateWeeks(sinceISO) {
-  const since = new Date(sinceISO);
-  const end = new Date();
-  let start = weekStartKey(since.toISOString());
-  if (start < sinceISO.slice(0, 10)) {
-    const d = new Date(start + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() + 7);
-    start = d.toISOString().slice(0, 10);
-  }
-  const weeks = [];
-  const cur = new Date(start + 'T00:00:00Z');
-  const endMs = end.getTime();
+  const out = [];
+  const cur = new Date(startOfWeekISO(sinceISO) + 'T00:00:00Z');
+  const endMs = Date.now();
   while (cur.getTime() <= endMs) {
-    weeks.push(cur.toISOString().slice(0, 10));
+    const key = cur.toISOString().slice(0, 10);
+    out.push({ key, label: new Date(key + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }) });
     cur.setUTCDate(cur.getUTCDate() + 7);
   }
-  return weeks;
+  return out;
+}
+function enumerateMonths(sinceISO) {
+  const out = [];
+  const s = new Date(sinceISO);
+  const cur = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), 1));
+  const now = new Date();
+  const endMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  while (cur.getTime() <= endMs) {
+    const key = cur.toISOString().slice(0, 7);
+    out.push({ key, label: cur.toLocaleDateString('en-US', { month: 'short', year: '2-digit', timeZone: 'UTC' }) });
+    cur.setUTCMonth(cur.getUTCMonth() + 1);
+  }
+  return out;
+}
+function enumeratePeriods(sinceISO, gran) {
+  return gran === 'month' ? enumerateMonths(sinceISO) : enumerateWeeks(sinceISO);
 }
 
-function buildWeeklyNetSeries(CWN, contributors, sinceISO) {
-  const weeks = enumerateWeeks(sinceISO);
-  const top = contributors.slice(0, 10);
-  const series = top.map(c => ({
-    login: c.login,
-    data: weeks.map(w => (CWN[c.login] && CWN[c.login][w]) || 0)
-  }));
-  return { weeks, series };
+// ── Aggregation (re-runs when granularity toggles; no refetch) ───────────────
+function aggregate(raw, gran) {
+  const periods = enumeratePeriods(raw.sinceISO, gran);
+  const pIndex = new Map(periods.map((p, i) => [p.key, i]));
+  const emptyRow = () => periods.map(() => ({ a: 0, d: 0, commits: 0 }));
+
+  const memberMap = new Map();
+  const overall = periods.map(() => ({ a: 0, d: 0, commits: 0, members: new Set() }));
+  let totA = 0, totD = 0, totC = 0;
+
+  for (const r of raw.records) {
+    let m = memberMap.get(r.member);
+    if (!m) {
+      m = { member: r.member, avatar: (raw.memberMeta[r.member] || {}).avatar || '', a: 0, d: 0, commits: 0, repos: new Set(), byPeriod: emptyRow() };
+      memberMap.set(r.member, m);
+    }
+    m.a += r.a; m.d += r.d; m.commits++; m.repos.add(r.repo);
+    totA += r.a; totD += r.d; totC++;
+
+    const pi = pIndex.get(periodKeyOf(r.date, gran));
+    if (pi !== undefined) {
+      m.byPeriod[pi].a += r.a; m.byPeriod[pi].d += r.d; m.byPeriod[pi].commits++;
+      overall[pi].a += r.a; overall[pi].d += r.d; overall[pi].commits++; overall[pi].members.add(r.member);
+    }
+  }
+
+  const members = [...memberMap.values()].map(m => ({
+    member: m.member, avatar: m.avatar, a: m.a, d: m.d, net: m.a - m.d, commits: m.commits,
+    repos: [...m.repos], activePeriods: m.byPeriod.filter(p => p.commits > 0).length,
+    byPeriod: m.byPeriod.map(p => ({ a: p.a, d: p.d, net: p.a - p.d, commits: p.commits }))
+  })).sort((x, y) => (y.net - x.net) || (y.commits - x.commits) || x.member.localeCompare(y.member));
+
+  const overallOut = overall.map(o => ({ a: o.a, d: o.d, net: o.a - o.d, commits: o.commits, activeMembers: o.members.size }));
+
+  return { periods, members, overall: overallOut, totals: { a: totA, d: totD, net: totA - totD, commits: totC } };
 }
 
-function formatNet(n) {
-  return (n >= 0 ? '+' : '') + n.toLocaleString();
+// ── Formatting ───────────────────────────────────────────────────────────────
+function fmtInt(n) { return Number(n || 0).toLocaleString(); }
+function fmtSigned(n) { return (n >= 0 ? '+' : '−') + Math.abs(n).toLocaleString(); }
+function fmtCompact(n) {
+  const abs = Math.abs(n);
+  if (abs >= 1000) return (n < 0 ? '−' : '') + (abs / 1000).toFixed(abs >= 10000 ? 0 : 1) + 'k';
+  return String(n);
+}
+function fmtSignedCompact(n) { return (n > 0 ? '+' : n < 0 ? '−' : '') + fmtCompact(Math.abs(n)); }
+function escHtml(str) {
+  if (str === 0) return '0';
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function timeAgo(dateStr) {
+  if (!dateStr) return '';
+  const days = Math.floor((Date.now() - new Date(dateStr).getTime()) / 864e5);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 30) return days + 'd ago';
+  if (days < 365) return Math.floor(days / 30) + 'mo ago';
+  return Math.floor(days / 365) + 'yr ago';
 }
 
 // ── Main loader ──────────────────────────────────────────────────────────────
 async function loadMetrics(token, org, days) {
   cancelled = false;
   lastParams = { token, org, days };
+  granularity = days <= 120 ? 'week' : 'month';
   clearError();
 
-  // UI state: loading
-  hide('dashboard');
-  hide('weeklyNetView');
-  hide('emptyState');
-  hide('sidebarNav');
+  hide('dashboard'); hide('teamView'); hide('emptyState'); hide('sidebarNav'); hide('sidebarStats');
   show('progress');
-  hide('sidebarStats');
   $('loadBtn').disabled = true;
   setProgress('Connecting to GitHub…', 5);
 
   const SINCE = new Date(Date.now() - days * 864e5).toISOString();
 
   try {
-    // Verify token
     const me = await ghFetch('/user', token);
     setProgress('Authenticated as ' + me.login, 10);
 
-    // Load repos
     setProgress('Loading repositories…', 15);
     let repos = [];
     try {
       repos = await getAllPages('/orgs/' + org + '/repos', token);
     } catch (e) {
-      try {
-        repos = await getAllPages('/users/' + org + '/repos', token);
-      } catch (e2) {
-        throw new Error('Cannot find org or user "' + org + '". ' + e.message);
-      }
+      try { repos = await getAllPages('/users/' + org + '/repos', token); }
+      catch (e2) { throw new Error('Cannot find org or user "' + org + '". ' + e.message); }
     }
-
     if (!repos.length) throw new Error('No repositories found in ' + org);
 
-    // Exclude repos with _build suffix
     repos = repos.filter(r => !r.name.endsWith('_build'));
-
     if (!repos.length) throw new Error('No repositories found in ' + org + ' after filtering');
-
-    // Sort by most recently updated
     repos.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
 
-    const CM = {};   // contributor map
-    const WM = {};   // weekly/monthly commit map
-    const CWN = {};  // contributor weekly NET map
-    const aliasToLogin = {}; // normalized email/name → github login
-    let totA = 0, totD = 0, totC = 0;
-
+    // Collect raw commits across all repos, then resolve identities in one pass.
+    const allCommits = [];
     const total = repos.length;
-
     for (let i = 0; i < repos.length; i++) {
       if (cancelled) throw new Error('Cancelled');
       const repo = repos[i];
-      const pct = 15 + ((i / total) * 70);
-
-      setProgress('Repo (' + (i + 1) + '/' + total + '): ' + repo.name, pct);
+      setProgress('Repo (' + (i + 1) + '/' + total + '): ' + repo.name, 15 + (i / total) * 70);
       try {
         const commits = await fetchRepoCommitsWithStats(org, repo.name, SINCE, token);
-        for (const c of commits) {
-          const ghLogin = (c.githubLogin || '').trim();
-          const emailLocal = emailLocalPart(c.email).trim();
-          const nameRaw = (c.name || '').trim();
-          const emailKey = normalizeIdentityKey(emailLocal);
-          const nameKey = normalizeIdentityKey(nameRaw);
-          const ghKey = normalizeIdentityKey(ghLogin);
-
-          if (ghLogin) {
-            const canonGh = canonicalContributorLogin(ghLogin);
-            if (emailKey) aliasToLogin[emailKey] = canonGh;
-            if (nameKey) aliasToLogin[nameKey] = canonGh;
-            if (ghKey) aliasToLogin[ghKey] = canonGh;
-
-            // Map normalized base handle → canonical login so email/name aliases line up.
-            const ghLower = ghLogin.toLowerCase();
-            if (ghLower.endsWith('savas') && ghLower.length > 'savas'.length) {
-              const baseKey = normalizeIdentityKey(canonGh);
-              if (baseKey) aliasToLogin[baseKey] = canonGh;
-            }
-          }
-
-          const login = canonicalContributorLogin(
-            ghLogin ||
-            (emailKey && aliasToLogin[emailKey]) ||
-            (nameKey && aliasToLogin[nameKey]) ||
-            emailLocal ||
-            nameRaw ||
-            'unknown'
-          );
-
-          if (!CM[login]) CM[login] = { login, avatar: c.avatar, commits: 0, additions: 0, deletions: 0, repos: [] };
-          CM[login].commits++;
-          CM[login].additions += c.additions;
-          CM[login].deletions += c.deletions;
-          if (c.avatar && !CM[login].avatar) CM[login].avatar = c.avatar;
-          if (!CM[login].repos.includes(repo.name)) CM[login].repos.push(repo.name);
-
-          totC++;
-          totA += c.additions;
-          totD += c.deletions;
-
-          if (c.committedDate) {
-            const k = c.committedDate.slice(0, 7); // YYYY-MM
-            WM[k] = (WM[k] || 0) + 1;
-            const wk = weekStartKey(c.committedDate);
-            if (!CWN[login]) CWN[login] = {};
-            CWN[login][wk] = (CWN[login][wk] || 0) + (c.additions - c.deletions);
-          }
-        }
-      } catch (e) { /* skip repo on error (empty repo, no access, etc.) */ }
+        for (const c of commits) allCommits.push(c);
+      } catch (e) { /* skip empty/inaccessible repo */ }
     }
 
-    setProgress('Rendering…', 90);
+    setProgress('Resolving contributors…', 88);
+    const { records, memberMeta } = resolveMembers(allCommits);
 
-    const contributors = Object.values(CM)
-      .sort((a, b) => {
-        const netB = (b.additions - b.deletions);
-        const netA = (a.additions - a.deletions);
-        if (netB !== netA) return netB - netA;          // NET desc
-        if (b.commits !== a.commits) return b.commits - a.commits; // commits desc
-        return a.login.localeCompare(b.login);          // stable-ish tie-breaker
-      });
+    RAW = {
+      records, memberMeta,
+      repos: repos.map(r => ({
+        name: r.name, description: r.description, language: r.language,
+        stargazers_count: r.stargazers_count, forks_count: r.forks_count,
+        open_issues_count: r.open_issues_count, updated_at: r.updated_at, html_url: r.html_url
+      })),
+      sinceISO: SINCE, days, org
+    };
 
-    const weekly = Object.entries(WM)
-      .sort((a, b) => a[0] < b[0] ? -1 : 1)
-      .map(([w, c]) => ({ w, c }));
-
-    const weeklyNet = buildWeeklyNetSeries(CWN, contributors, SINCE);
-
-    renderDashboard({ repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO: SINCE });
-
+    setProgress('Rendering…', 94);
+    renderAll();
   } catch (e) {
     hide('progress');
     $('loadBtn').disabled = false;
-    if (e.message !== 'Cancelled') {
-      showError(e.message);
-      show('emptyState');
-    }
+    if (e.message !== 'Cancelled') { showError(e.message); show('emptyState'); }
   }
 }
 
-// ── Page navigation ────────────────────────────────────────────────────────────
+// ── Render orchestration ─────────────────────────────────────────────────────
 const CHART_COLORS = ['#58a6ff', '#3fb950', '#f85149', '#bc8cff', '#d29922', '#79c0ff', '#ffa657', '#ff7b72', '#a5d6ff', '#7ee787'];
+const GREEN = [63, 185, 80], RED = [248, 81, 73];
 
-function destroyWeeklyNetChart() {
-  if (weeklyNetChart) {
-    weeklyNetChart.destroy();
-    weeklyNetChart = null;
-  }
-}
+function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
 
-function setActivePage(page) {
-  if (!lastDashboardData) return;
-  activePage = page;
+function renderAll() {
+  if (!RAW) return;
+  DATA = aggregate(RAW, granularity);
 
-  document.querySelectorAll('.nav-link').forEach(el => {
-    el.classList.toggle('active', el.dataset.page === page);
-  });
-
-  if (page === 'overview') {
-    destroyWeeklyNetChart();
-    show('dashboard');
-    hide('weeklyNetView');
-  } else {
-    hide('dashboard');
-    show('weeklyNetView');
-    renderWeeklyNetChart(lastDashboardData.weeklyNet);
-  }
-}
-
-function renderWeeklyNetChart({ weeks, series }) {
-  destroyWeeklyNetChart();
-  if (!weeks.length || !series.length) return;
-
-  const ctx = $('weeklyNetChart').getContext('2d');
-  weeklyNetChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: weeks.map(formatWeekLabel),
-      datasets: series.map((s, i) => ({
-        label: s.login,
-        data: s.data,
-        borderColor: CHART_COLORS[i % CHART_COLORS.length],
-        backgroundColor: 'transparent',
-        tension: 0.3,
-        pointRadius: 3,
-        pointHoverRadius: 5,
-        borderWidth: 2
-      }))
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: {
-          display: true,
-          position: 'top',
-          labels: { color: '#8b949e', font: { size: 12 }, boxWidth: 12, boxHeight: 12 }
-        },
-        tooltip: {
-          mode: 'index',
-          intersect: false,
-          callbacks: {
-            label: ctx => ctx.dataset.label + ': ' + formatNet(ctx.parsed.y)
-          }
-        }
-      },
-      scales: {
-        x: {
-          ticks: { color: '#6e7681', font: { size: 11 }, maxRotation: 45 },
-          grid: { color: '#21262d' }
-        },
-        y: {
-          beginAtZero: true,
-          ticks: {
-            color: '#6e7681',
-            font: { size: 11 },
-            callback: v => formatNet(v)
-          },
-          grid: { color: '#21262d' }
-        }
-      }
-    }
-  });
-}
-
-// ── Render ───────────────────────────────────────────────────────────────────
-function renderDashboard({ repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO }) {
-  hide('progress');
-  hide('emptyState');
+  hide('progress'); hide('emptyState');
   $('loadBtn').disabled = false;
 
-  lastDashboardData = { repos, contributors, weekly, weeklyNet, totA, totD, totC, days, org, sinceISO };
-
-  // Destroy old charts
-  charts.forEach(c => c.destroy());
-  charts = [];
-  destroyWeeklyNetChart();
-
-  const net = totA - totD;
-  const subtitle =
-    'Last ' + days + ' days  ·  ' + repos.length + ' repos  ·  ' + contributors.length + ' contributors  ·  all branches (commits deduped)';
-
-  // Header
-  $('dashTitle').textContent = org;
+  const subtitle = 'Last ' + RAW.days + ' days · ' + RAW.repos.length + ' repos · ' +
+    DATA.members.length + ' team members · by ' + granularity;
+  $('dashTitle').textContent = RAW.org;
   $('dashSubtitle').textContent = subtitle;
-  $('weeklyNetTitle').textContent = org;
-  $('weeklyNetSubtitle').textContent = subtitle;
+  $('teamTitle').textContent = RAW.org;
+  $('teamSubtitle').textContent = subtitle;
 
-  // Metric cards
-  const metricsData = [
-    { label: 'Total Commits', value: totC.toLocaleString(), icon: '📝' },
-    { label: 'Lines Added', value: '+' + totA.toLocaleString(), icon: '🟢', cls: 'green' },
-    { label: 'Lines Removed', value: '−' + totD.toLocaleString(), icon: '🔴', cls: 'red' },
-    { label: 'Net Change', value: (net >= 0 ? '+' : '') + net.toLocaleString(), icon: '📊', cls: net >= 0 ? 'green' : 'red' },
-    { label: 'Repositories', value: repos.length, icon: '📁' },
-    { label: 'Contributors', value: contributors.length, icon: '👥' },
+  renderKPIs();
+  renderTeam();       // DOM/SVG — safe to build while hidden
+  renderRepos();
+  syncGranButtons();
+
+  show('sidebarNav'); show('sidebarStats');
+  setActiveView(activeView);
+}
+
+function setActiveView(view) {
+  if (!DATA) return;
+  activeView = view;
+  document.querySelectorAll('.nav-link').forEach(el => el.classList.toggle('active', el.dataset.view === view));
+
+  destroyCharts();
+  if (view === 'overview') { show('dashboard'); hide('teamView'); renderOverviewCharts(); }
+  else { hide('dashboard'); show('teamView'); }
+}
+
+function setGranularity(g) {
+  if (g === granularity) return;
+  granularity = g;
+  renderAll();
+}
+function syncGranButtons() {
+  document.querySelectorAll('.gran-btn').forEach(b => b.classList.toggle('active', b.dataset.gran === granularity));
+}
+
+// ── KPIs ─────────────────────────────────────────────────────────────────────
+function renderKPIs() {
+  const t = DATA.totals;
+  const cards = [
+    { label: 'Team Members', value: fmtInt(DATA.members.length), icon: '👥' },
+    { label: 'Commits', value: fmtInt(t.commits), icon: '📝', sub: 'excl. merges' },
+    { label: 'Lines Added', value: '+' + fmtInt(t.a), icon: '🟢', cls: 'green' },
+    { label: 'Lines Removed', value: '−' + fmtInt(t.d), icon: '🔴', cls: 'red' },
+    { label: 'Net Contribution', value: fmtSigned(t.net), icon: '📊', cls: t.net >= 0 ? 'green' : 'red' },
+    { label: 'Repositories', value: fmtInt(RAW.repos.length), icon: '📁' },
   ];
-
-  $('metricGrid').innerHTML = metricsData.map(m => `
+  $('metricGrid').innerHTML = cards.map(m => `
     <div class="metric-card">
       <div class="m-icon">${m.icon}</div>
       <div class="m-label">${m.label}</div>
       <div class="m-value${m.cls ? ' ' + m.cls : ''}">${m.value}</div>
-    </div>
-  `).join('');
+      ${m.sub ? `<div class="m-sub">${m.sub}</div>` : ''}
+    </div>`).join('');
 
-  // Sidebar stats
-  $('sidebarStats').innerHTML = metricsData.map(m => `
-    <div class="stat-row">
-      <span class="stat-label">${m.label}</span>
-      <span class="stat-val">${m.value}</span>
-    </div>
-  `).join('');
-  show('sidebarStats');
+  $('sidebarStats').innerHTML = cards.map(m => `
+    <div class="stat-row"><span class="stat-label">${m.label}</span><span class="stat-val">${m.value}</span></div>`).join('');
+}
 
-  // Activity chart
-  if (weekly.length) {
-    const actCtx = $('activityChart').getContext('2d');
-    charts.push(new Chart(actCtx, {
-      type: 'line',
-      data: {
-        labels: weekly.map(x => x.w),
-        datasets: [{
-          label: 'Commits',
-          data: weekly.map(x => x.c),
-          borderColor: '#58a6ff',
-          backgroundColor: 'rgba(88,166,255,0.1)',
-          fill: true,
-          tension: 0.4,
-          pointRadius: 4,
-          pointBackgroundColor: '#58a6ff',
-          borderWidth: 2
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false },
-          tooltip: { mode: 'index', intersect: false }
-        },
-        scales: {
-          x: {
-            ticks: { color: '#6e7681', font: { size: 11 }, maxRotation: 45 },
-            grid: { color: '#21262d' }
-          },
-          y: {
-            beginAtZero: true,
-            ticks: { color: '#6e7681', font: { size: 11 } },
-            grid: { color: '#21262d' }
-          }
-        }
-      }
-    }));
-  }
+// ── Overview charts (goal 2: overall contributions) ──────────────────────────
+function renderOverviewCharts() {
+  const labels = DATA.periods.map(p => p.label);
+  const adds = DATA.overall.map(o => o.a);
+  const dels = DATA.overall.map(o => -o.d);   // below zero
+  const nets = DATA.overall.map(o => o.net);
 
-  // Contributor bar chart
-  if (contributors.length) {
-    const top = contributors.slice(0, 15);
-    const h = Math.max(260, top.length * 44 + 80);
-    $('contribChartWrap').style.height = h + 'px';
+  // Team output over time: additions up / deletions down + net line
+  const outCtx = $('outputChart').getContext('2d');
+  charts.push(new Chart(outCtx, {
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'Additions', data: adds, backgroundColor: 'rgba(63,185,80,0.75)', borderRadius: 3, stack: 'loc', order: 2 },
+        { type: 'bar', label: 'Deletions', data: dels, backgroundColor: 'rgba(248,81,73,0.75)', borderRadius: 3, stack: 'loc', order: 2 },
+        { type: 'line', label: 'Net', data: nets, borderColor: '#58a6ff', backgroundColor: '#58a6ff', tension: 0.3, borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, order: 1 }
+      ]
+    },
+    options: baseChartOpts({
+      // parsed.y already carries the right sign for each series (additions +,
+      // deletions plotted negative, net signed), so format it directly.
+      stacked: true,
+      tooltip: ctx => ctx.dataset.label + ': ' + fmtSigned(ctx.parsed.y)
+    })
+  }));
 
-    const ccCtx = $('contribChart').getContext('2d');
-    charts.push(new Chart(ccCtx, {
-      type: 'bar',
-      data: {
-        labels: top.map(c => c.login),
-        datasets: [
-          {
-            label: 'Additions',
-            data: top.map(c => c.additions),
-            backgroundColor: 'rgba(63,185,80,0.8)',
-            borderRadius: 4
-          },
-          {
-            label: 'Deletions',
-            data: top.map(c => c.deletions),
-            backgroundColor: 'rgba(248,81,73,0.8)',
-            borderRadius: 4
-          }
-        ]
-      },
-      options: {
-        indexAxis: 'y',
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: {
-            display: true,
-            position: 'top',
-            labels: { color: '#8b949e', font: { size: 12 }, boxWidth: 12, boxHeight: 12 }
-          },
-          tooltip: { mode: 'index', intersect: false }
-        },
-        scales: {
-          x: {
-            ticks: { color: '#6e7681', font: { size: 11 } },
-            grid: { color: '#21262d' }
-          },
-          y: {
-            ticks: { color: '#e6edf3', font: { size: 12 } },
-            grid: { color: '#21262d' }
-          }
-        }
-      }
-    }));
-  }
+  // Cumulative net — codebase growth trajectory
+  let run = 0;
+  const cum = nets.map(v => (run += v));
+  const cumCtx = $('cumulativeChart').getContext('2d');
+  charts.push(new Chart(cumCtx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Cumulative net', data: cum, borderColor: '#bc8cff',
+        backgroundColor: 'rgba(188,140,255,0.12)', fill: true, tension: 0.3,
+        pointRadius: 3, pointHoverRadius: 5, borderWidth: 2
+      }]
+    },
+    options: baseChartOpts({ legend: false, tooltip: ctx => 'Cumulative net: ' + fmtSigned(ctx.parsed.y) })
+  }));
+}
 
-  // Contributor table
-  $('contribBody').innerHTML = contributors.map((c, i) => {
-    const net = c.additions - c.deletions;
-    const initials = c.login.slice(0, 2).toUpperCase();
-    return `
-      <tr>
-        <td>
-          <div class="contributor-name">
-            <div class="avatar">
-              ${c.avatar ? `<img src="${c.avatar}" alt="${c.login}" loading="lazy" />` : initials}
-            </div>
-            ${c.login}
-          </div>
-        </td>
-        <td class="num">${c.commits.toLocaleString()}</td>
-        <td class="num ${net >= 0 ? 'green' : 'red'}">${net >= 0 ? '+' : ''}${net.toLocaleString()}</td>
-      </tr>
-    `;
+function baseChartOpts({ stacked = false, legend = true, tooltip } = {}) {
+  return {
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: legend ? { display: true, position: 'top', labels: { color: '#8b949e', font: { size: 12 }, boxWidth: 12, boxHeight: 12, usePointStyle: true } } : { display: false },
+      tooltip: { mode: 'index', intersect: false, callbacks: tooltip ? { label: tooltip } : {} }
+    },
+    scales: {
+      x: { stacked, ticks: { color: '#6e7681', font: { size: 11 }, maxRotation: 45, autoSkip: true, maxTicksLimit: 16 }, grid: { color: '#21262d' } },
+      y: { stacked, ticks: { color: '#6e7681', font: { size: 11 }, callback: v => fmtCompact(v) }, grid: { color: '#21262d', zeroLineColor: '#484f58' } }
+    }
+  };
+}
+
+// ── Team views (goal 1: net contribution per member by period) ───────────────
+function renderTeam() {
+  renderHeatmap();
+  renderLeaderboard();
+  $('teamNote').innerHTML = 'Net = additions − deletions, attributed to the commit <strong>author</strong>. ' +
+    'Merge commits and bots excluded · commits de-duplicated across all branches. Colour intensity is relative to the largest net cell.';
+}
+
+function heatColor(v, maxAbs) {
+  if (!v || !maxAbs) return { bg: 'transparent', fg: 'var(--text3)' };
+  const t = Math.min(1, Math.sqrt(Math.abs(v) / maxAbs)); // perceptual-ish
+  const [r, g, b] = v > 0 ? GREEN : RED;
+  const alpha = 0.10 + 0.80 * t;
+  return { bg: `rgba(${r},${g},${b},${alpha.toFixed(3)})`, fg: t > 0.55 ? '#0d1117' : 'var(--text)' };
+}
+
+function renderHeatmap() {
+  const { periods, members, overall } = DATA;
+  const wrap = $('heatmap');
+  if (!members.length || !periods.length) { wrap.innerHTML = '<p class="empty-note">No contribution data in this period.</p>'; return; }
+
+  let maxAbs = 0;
+  for (const m of members) for (const p of m.byPeriod) maxAbs = Math.max(maxAbs, Math.abs(p.net));
+
+  const head = '<tr><th class="hm-corner">Team member</th>' +
+    periods.map(p => `<th class="hm-period">${escHtml(p.label)}</th>`).join('') +
+    '<th class="hm-total-h">Total</th></tr>';
+
+  const rows = members.map(m => {
+    const cells = m.byPeriod.map((p, i) => {
+      const c = heatColor(p.net, maxAbs);
+      const title = `${m.member} · ${periods[i].label}\n${fmtSigned(p.net)} net  (+${fmtInt(p.a)} / −${fmtInt(p.d)})  ·  ${p.commits} commit${p.commits === 1 ? '' : 's'}`;
+      const txt = p.commits ? fmtSignedCompact(p.net) : '';
+      return `<td class="hm-cell" style="background:${c.bg};color:${c.fg}" title="${escHtml(title)}">${txt}</td>`;
+    }).join('');
+    const netCls = m.net >= 0 ? 'green' : 'red';
+    return `<tr>
+      <th class="hm-member">
+        <span class="avatar sm">${m.avatar ? `<img src="${escHtml(m.avatar)}" alt="" loading="lazy"/>` : escHtml(m.member.slice(0, 2).toUpperCase())}</span>
+        <span class="hm-name" title="${escHtml(m.member)}">${escHtml(m.member)}</span>
+      </th>
+      ${cells}
+      <td class="hm-total ${netCls}">${fmtSigned(m.net)}</td>
+    </tr>`;
   }).join('');
 
-  // Repo grid
-  $('repoGrid').innerHTML = repos.map(r => `
+  const footCells = overall.map((o, i) => {
+    const c = heatColor(o.net, maxAbs);
+    return `<td class="hm-cell strong" style="background:${c.bg};color:${c.fg}" title="${escHtml('Team · ' + periods[i].label + '\n' + fmtSigned(o.net) + ' net · ' + o.commits + ' commits')}">${o.commits ? fmtSignedCompact(o.net) : ''}</td>`;
+  }).join('');
+  const grand = DATA.totals.net;
+  const foot = `<tr class="hm-foot"><th class="hm-member">Team total</th>${footCells}<td class="hm-total ${grand >= 0 ? 'green' : 'red'}">${fmtSigned(grand)}</td></tr>`;
+
+  wrap.innerHTML = `<div class="heatmap-scroll"><table class="heatmap"><thead>${head}</thead><tbody>${rows}</tbody><tfoot>${foot}</tfoot></table></div>`;
+}
+
+/** Inline SVG bar sparkline of net per period, on a shared scale so members compare. */
+function sparkline(byPeriod, maxAbs) {
+  const n = byPeriod.length;
+  const W = 132, H = 34, gap = 1;
+  const bw = Math.max(1, (W - (n - 1) * gap) / n);
+  const mid = H / 2;
+  const scale = maxAbs ? (H / 2 - 2) / maxAbs : 0;
+  let bars = '';
+  byPeriod.forEach((p, i) => {
+    const x = i * (bw + gap);
+    if (!p.commits) { bars += `<rect x="${x.toFixed(2)}" y="${mid - 0.5}" width="${bw.toFixed(2)}" height="1" fill="var(--border)"/>`; return; }
+    const h = Math.max(1, Math.abs(p.net) * scale);
+    const y = p.net >= 0 ? mid - h : mid;
+    const fill = p.net >= 0 ? 'var(--green)' : 'var(--red)';
+    bars += `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${bw.toFixed(2)}" height="${h.toFixed(2)}" fill="${fill}" rx="0.5"/>`;
+  });
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" preserveAspectRatio="none" aria-hidden="true">
+    <line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="var(--border)" stroke-width="0.5"/>${bars}</svg>`;
+}
+
+function renderLeaderboard() {
+  const { members } = DATA;
+  let maxAbs = 0;
+  for (const m of members) for (const p of m.byPeriod) maxAbs = Math.max(maxAbs, Math.abs(p.net));
+
+  $('leaderBody').innerHTML = members.map((m, i) => {
+    const netCls = m.net >= 0 ? 'green' : 'red';
+    const initials = m.member.slice(0, 2).toUpperCase();
+    return `<tr>
+      <td class="rank">${i + 1}</td>
+      <td>
+        <div class="contributor-name">
+          <span class="avatar">${m.avatar ? `<img src="${escHtml(m.avatar)}" alt="" loading="lazy"/>` : initials}</span>
+          <span class="hm-name" title="${escHtml(m.member)}">${escHtml(m.member)}</span>
+        </div>
+      </td>
+      <td class="spark-cell">${sparkline(m.byPeriod, maxAbs)}</td>
+      <td class="num">${fmtInt(m.commits)}</td>
+      <td class="num green">+${fmtInt(m.a)}</td>
+      <td class="num red">−${fmtInt(m.d)}</td>
+      <td class="num ${netCls} strong">${fmtSigned(m.net)}</td>
+      <td class="num muted">${m.repos.length}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Repositories ─────────────────────────────────────────────────────────────
+function renderRepos() {
+  $('repoGrid').innerHTML = RAW.repos.map(r => `
     <div class="repo-card">
       <div class="repo-name">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:-1px;margin-right:5px;opacity:.6"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8Z"/></svg>
@@ -680,57 +693,30 @@ function renderDashboard({ repos, contributors, weekly, weeklyNet, totA, totD, t
         ${r.open_issues_count ? `<span class="repo-stat">⚠ ${r.open_issues_count}</span>` : ''}
         <span class="repo-stat" title="Updated">${timeAgo(r.updated_at)}</span>
       </div>
-    </div>
-  `).join('');
-
-  show('sidebarNav');
-  setActivePage('overview');
+    </div>`).join('');
 }
 
-// ── Utilities ────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function timeAgo(dateStr) {
-  if (!dateStr) return '';
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const days = Math.floor(diff / 864e5);
-  if (days === 0) return 'today';
-  if (days === 1) return 'yesterday';
-  if (days < 30) return days + 'd ago';
-  if (days < 365) return Math.floor(days / 30) + 'mo ago';
-  return Math.floor(days / 365) + 'yr ago';
-}
-
-// ── Form submit ──────────────────────────────────────────────────────────────
+// ── Wiring ───────────────────────────────────────────────────────────────────
 $('configForm').addEventListener('submit', e => {
   e.preventDefault();
   const token = $('token').value.trim();
   const org = $('org').value.trim();
-  const days = parseInt($('days').value);
-
+  const days = parseInt($('days').value, 10);
   if (!token) { showError('Please enter a GitHub personal access token.'); return; }
   if (!org) { showError('Please enter an organization or user name.'); return; }
-
-  try { localStorage.setItem('gh_metrics_token', token); } catch (_) { }
-
+  try { localStorage.setItem('gh_metrics_token', token); } catch (_) {}
   clearError();
   loadMetrics(token, org, days);
 });
 
-// Restore token from localStorage (best-effort)
 try {
   const saved = localStorage.getItem('gh_metrics_token');
   if (saved && !$('token').value) $('token').value = saved;
-} catch (_) { }
+} catch (_) {}
 
-// Sidebar navigation
 document.querySelectorAll('.nav-link').forEach(el => {
-  el.addEventListener('click', e => {
-    e.preventDefault();
-    if (!lastDashboardData) return;
-    setActivePage(el.dataset.page);
-  });
+  el.addEventListener('click', e => { e.preventDefault(); if (DATA) setActiveView(el.dataset.view); });
+});
+document.querySelectorAll('.gran-btn').forEach(el => {
+  el.addEventListener('click', e => { e.preventDefault(); setGranularity(el.dataset.gran); });
 });

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GitHub Team Metrics — SAVAS POULTRY ADVISING</title>
+  <title>GitHub Team Metrics</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -17,8 +17,8 @@
     </div>
 
     <nav id="sidebarNav" class="sidebar-nav" style="display:none;">
-      <a href="#" class="nav-link active" data-page="overview">Overview</a>
-      <a href="#" class="nav-link" data-page="weeklyNet">Weekly NET</a>
+      <a href="#" class="nav-link active" data-view="overview">Overall contributions</a>
+      <a href="#" class="nav-link" data-view="team">Net by team member</a>
     </nav>
 
     <form id="configForm" class="config-form">
@@ -27,7 +27,7 @@
         <div class="token-wrap">
           <input type="password" id="token" placeholder="ghp_…" autocomplete="off" value="" />
           <button type="button" class="eye-btn" onclick="toggleToken()" title="Show/hide token">
-            <svg id="eyeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
         <span class="hint">Needs <code>repo</code> + <code>read:org</code> scopes</span>
@@ -69,57 +69,46 @@
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
       </div>
       <h2>GitHub Team Metrics</h2>
-      <p>Enter your token and organization name on the left, then click <strong>Load Metrics</strong> to see contributor stats, lines of code, commit activity and more.</p>
+      <p>Enter your token and organization on the left, then click <strong>Load Metrics</strong>. Work is attributed to each commit&rsquo;s <strong>author</strong> (the person who wrote it), de-duplicated across every branch.</p>
       <ul class="feature-list">
-        <li>📊 Lines added / removed per contributor</li>
-        <li>🔥 Commit activity over time</li>
-        <li>👥 Per-repo breakdown per developer</li>
+        <li>📊 Overall team output &amp; net change over time</li>
+        <li>🔥 Net contribution of each team member, by period</li>
+        <li>👥 Per-member trend, additions, deletions &amp; net</li>
         <li>📁 Full repository overview</li>
       </ul>
     </div>
 
+    <!-- ── Overall contributions ── -->
     <div id="dashboard" style="display:none;">
       <div class="dash-header">
         <div>
           <h1 id="dashTitle">—</h1>
           <p id="dashSubtitle" class="dash-subtitle">—</p>
         </div>
-        <button class="refresh-btn" onclick="reload()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>
-          Refresh
-        </button>
+        <div class="header-actions">
+          <div class="gran-toggle" role="group" aria-label="Period granularity">
+            <button class="gran-btn" data-gran="week">Weekly</button>
+            <button class="gran-btn" data-gran="month">Monthly</button>
+          </div>
+          <button class="refresh-btn" onclick="reload()" title="Reload from GitHub">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>
+            Refresh
+          </button>
+        </div>
       </div>
 
       <div class="metric-grid" id="metricGrid"></div>
 
       <div class="section">
-        <h2 class="section-title">Monthly Commit Activity</h2>
-        <div class="chart-wrap">
-          <canvas id="activityChart"></canvas>
-        </div>
+        <h2 class="section-title">Team output over time</h2>
+        <p class="section-hint">Additions (up) vs deletions (down) per period, with net change as a line. Lines added and removed across all repositories.</p>
+        <div class="chart-wrap chart-wrap-tall"><canvas id="outputChart"></canvas></div>
       </div>
 
       <div class="section">
-        <h2 class="section-title">Lines of Code per Contributor</h2>
-        <div class="chart-wrap" id="contribChartWrap">
-          <canvas id="contribChart"></canvas>
-        </div>
-      </div>
-
-      <div class="section">
-        <h2 class="section-title">Contributor Breakdown</h2>
-        <div class="table-wrap">
-          <table id="contribTable">
-            <thead>
-              <tr>
-                <th>Contributor</th>
-                <th class="num">Commits</th>
-                <th class="num">Net</th>
-              </tr>
-            </thead>
-            <tbody id="contribBody"></tbody>
-          </table>
-        </div>
+        <h2 class="section-title">Cumulative net contribution</h2>
+        <p class="section-hint">Running total of net lines (additions − deletions) — the codebase growth trajectory over the selected period.</p>
+        <div class="chart-wrap"><canvas id="cumulativeChart"></canvas></div>
       </div>
 
       <div class="section">
@@ -128,23 +117,55 @@
       </div>
     </div>
 
-    <div id="weeklyNetView" class="page-view" style="display:none;">
+    <!-- ── Net contribution by team member ── -->
+    <div id="teamView" class="page-view" style="display:none;">
       <div class="dash-header">
         <div>
-          <h1 id="weeklyNetTitle">—</h1>
-          <p id="weeklyNetSubtitle" class="dash-subtitle">—</p>
+          <h1 id="teamTitle">—</h1>
+          <p id="teamSubtitle" class="dash-subtitle">—</p>
         </div>
-        <button class="refresh-btn" onclick="reload()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>
-          Refresh
-        </button>
+        <div class="header-actions">
+          <div class="gran-toggle" role="group" aria-label="Period granularity">
+            <button class="gran-btn" data-gran="week">Weekly</button>
+            <button class="gran-btn" data-gran="month">Monthly</button>
+          </div>
+          <button class="refresh-btn" onclick="reload()" title="Reload from GitHub">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>
+            Refresh
+          </button>
+        </div>
       </div>
 
       <div class="section">
-        <h2 class="section-title">Weekly NET per Contributor</h2>
-        <p class="section-hint">Calendar weeks (Mon–Sun). Top 10 contributors by total NET in the selected period.</p>
-        <div class="chart-wrap chart-wrap-tall" id="weeklyNetChartWrap">
-          <canvas id="weeklyNetChart"></canvas>
+        <h2 class="section-title">Net contribution — team member × period</h2>
+        <p class="section-hint" id="teamNote"></p>
+        <div id="heatmap"></div>
+        <div class="heat-legend">
+          <span class="legend-swatch red"></span> net removed
+          <span class="legend-track"><span></span></span>
+          <span class="legend-swatch green"></span> net added
+        </div>
+      </div>
+
+      <div class="section">
+        <h2 class="section-title">Per-member breakdown</h2>
+        <p class="section-hint">Trend = net contribution per period (green above the line, red below), on a shared scale so members are comparable. Sorted by net contribution.</p>
+        <div class="table-wrap">
+          <table id="leaderTable">
+            <thead>
+              <tr>
+                <th class="num">#</th>
+                <th>Team member</th>
+                <th>Trend</th>
+                <th class="num">Commits</th>
+                <th class="num">Added</th>
+                <th class="num">Removed</th>
+                <th class="num">Net</th>
+                <th class="num">Repos</th>
+              </tr>
+            </thead>
+            <tbody id="leaderBody"></tbody>
+          </table>
         </div>
       </div>
     </div>
